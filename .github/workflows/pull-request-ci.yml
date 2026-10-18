@@ -8,10 +8,12 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  statuses: write
 
 jobs:
   pr-check:
-    name: Frontend CI
+    name: Manual PR Check
+
     if: >-
       github.event.issue.pull_request &&
       github.event.comment.body == '/pr-check' &&
@@ -20,13 +22,44 @@ jobs:
         github.event.comment.author_association == 'MEMBER' ||
         github.event.comment.author_association == 'COLLABORATOR'
       )
+
     runs-on: ubuntu-latest
 
     steps:
+      - name: Get PR commit SHA
+        id: pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pull_number = context.issue.number;
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number
+            });
+
+            core.setOutput('sha', pr.head.sha);
+
+      - name: Mark CI as pending
+        uses: actions/github-script@v7
+        env:
+          HEAD_SHA: ${{ steps.pr.outputs.sha }}
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              ...context.repo,
+              sha: process.env.HEAD_SHA,
+              state: 'pending',
+              context: 'Frontend CI',
+              description: 'PR checks are running'
+            });
+
       - name: Checkout PR code
         uses: actions/checkout@v4
         with:
-          ref: refs/pull/${{ github.event.issue.number }}/head
+          ref: ${{ steps.pr.outputs.sha }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -35,10 +68,45 @@ jobs:
           cache: npm
 
       - name: Install dependencies
+        id: install
         run: npm ci
 
       - name: Run ESLint
+        id: lint
         run: npm run lint
 
       - name: Build React app
+        id: build
         run: npm run build
+
+      - name: Report final status to PR
+        if: always() && steps.pr.outputs.sha != ''
+        uses: actions/github-script@v7
+        env:
+          HEAD_SHA: ${{ steps.pr.outputs.sha }}
+          CHECKOUT_RESULT: ${{ steps.checkout.outcome }}
+          INSTALL_RESULT: ${{ steps.install.outcome }}
+          LINT_RESULT: ${{ steps.lint.outcome }}
+          BUILD_RESULT: ${{ steps.build.outcome }}
+        with:
+          script: |
+            const results = [
+              process.env.CHECKOUT_RESULT,
+              process.env.INSTALL_RESULT,
+              process.env.LINT_RESULT,
+              process.env.BUILD_RESULT
+            ];
+
+            const passed = results.every(
+              result => result === 'success'
+            );
+
+            await github.rest.repos.createCommitStatus({
+              ...context.repo,
+              sha: process.env.HEAD_SHA,
+              state: passed ? 'success' : 'failure',
+              context: 'Frontend CI',
+              description: passed
+                ? 'All PR checks passed'
+                : 'One or more PR checks failed'
+            });
